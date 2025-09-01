@@ -11,48 +11,111 @@ This fork contains several fixes and changes for stability in serverless environ
 - **CMake for heterogeneous CPUs**: `libisyntax/CMakeLists.txt` avoids `-march=native` and disables STB SIMD with `STBI_NO_SIMD` to prevent illegal-instruction crashes on unknown host CPUs (e.g., Lambda). ARM/Apple Silicon flags are handled conditionally.
 - **Benaphore file mutex**: Public functions lock `isyntax->file_mutex` around IO-sensitive operations to reduce race conditions in multi-threaded contexts.
 
-## Building and packaging for Lambda
+## Building for Lambda (container image, preferred)
 
-The typical deployment flow in this repository packages the shared library separately and downloads it at runtime in Lambda:
+This repo can be built into a Lambda container image that already contains `libisyntax.so` under `/opt`. No S3 download is required at runtime.
 
-1. Build the shared object `libisyntax.so` inside a Lambda-compatible container (see project root `Dockerfile.build`).
-2. Zip the artifact and upload to S3 (see project root `build_and_upload.ps1`).
-3. The Lambda function (`lambda_function.py` in the project root) downloads `libisyntax.zip` from S3 into `/tmp`, extracts it, and `ctypes.CDLL` loads `libisyntax.so`.
+Dockerfile used: project root `Dockerfile.lambda` (copies `libisyntax/`, builds `libisyntax.so`, places it in `/opt`, installs Python deps to `/opt/python`, and copies `lambda_function.py`).
 
-Notes:
-- The library must be built on/for Amazon Linux compatible glibc to load in Python 3.11 Lambda.
-- Keep CPU features generic (no host-specific `-march`) to avoid `SIGILL` on Lambda hosts.
+Build locally:
 
-## Using the library safely (C API)
-
-Minimum happy path:
-
-```c
-// 1) Initialize once per process
-libisyntax_init();
-
-// 2) Open a file (flag 1 initializes internal allocators on the handle)
-isyntax_t* handle = NULL;
-libisyntax_open("/path/slide.isyntax", 1 /* LIBISYNTAX_OPEN_FLAG_INIT_ALLOCATORS */, &handle);
-
-// 3a) One-shot tile read (no explicit cache) – safe in this fork
-uint32_t* pixels = malloc(256 * 256 * sizeof(uint32_t));
-libisyntax_tile_read(handle, NULL, 0, 0, 0, pixels, 0x101 /* RGBA */);
-
-// 3b) Preferred for performance: create and reuse a cache
-// libisyntax_cache_t* cache; libisyntax_cache_create("app-cache", 1024, &cache);
-// libisyntax_cache_inject(cache, handle);
-// libisyntax_tile_read(handle, cache, level, tile_x, tile_y, pixels, 0x101);
-// libisyntax_cache_destroy(cache);
-
-// 4) Close
-libisyntax_close(handle);
-free(pixels);
+```bash
+docker build -f Dockerfile.lambda -t lambda-libisyntax:latest .
 ```
 
-Recommendations:
-- Reuse a cache for multiple tile reads to avoid repeated allocator setup/teardown.
-- The temporary cache path is provided for safety and convenience but is slower for many reads.
+Test locally (Lambda Runtime Interface Emulator):
+
+```bash
+docker run -p 9000:8080 lambda-libisyntax:latest
+# In another shell, invoke:
+curl -s "http://localhost:9000/2015-03-31/functions/function/invocations" -d '{}'
+```
+
+Push to ECR and deploy as a Lambda (example):
+
+```bash
+AWS_ACCOUNT_ID=123456789012
+AWS_REGION=us-east-1
+REPO=lambda-libisyntax
+
+# Create repo (once)
+aws ecr create-repository --repository-name $REPO --region $AWS_REGION || true
+
+# Authenticate Docker to ECR
+aws ecr get-login-password --region $AWS_REGION | \
+  docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+# Tag and push
+docker tag lambda-libisyntax:latest ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO:latest
+docker push ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO:latest
+
+# Create function (first time)
+aws lambda create-function \
+  --function-name libisyntax-test \
+  --package-type Image \
+  --code ImageUri=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO:latest \
+  --role arn:aws:iam::<account-id>:role/<lambda-execution-role> \
+  --region $AWS_REGION
+
+# Or update code on subsequent pushes
+aws lambda update-function-code \
+  --function-name libisyntax-test \
+  --image-uri ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/$REPO:latest \
+  --region $AWS_REGION
+```
+
+Notes:
+- Built on Amazon Linux base (`public.ecr.aws/lambda/python:3.11`) to match Lambda glibc.
+- `CMakeLists.txt` avoids host-specific CPU flags and disables STB SIMD to prevent illegal instructions.
+
+## Minimal Lambda usage (Python)
+
+Example handler that loads `libisyntax.so` bundled inside the Lambda container image (no S3), opens a slide from `/opt` or `/var/task`, reads one tile, and returns basic info.
+
+```python
+import os, ctypes, tempfile
+
+def load_api(path):
+    lib = ctypes.CDLL(path)
+    # minimal signatures used below
+    lib.libisyntax_init.restype = ctypes.c_int
+    lib.libisyntax_open.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+    lib.libisyntax_open.restype = ctypes.c_int
+    lib.libisyntax_close.argtypes = [ctypes.c_void_p]
+    lib.libisyntax_get_tile_width.argtypes = [ctypes.c_void_p]
+    lib.libisyntax_get_tile_width.restype = ctypes.c_int
+    lib.libisyntax_get_tile_height.argtypes = [ctypes.c_void_p]
+    lib.libisyntax_get_tile_height.restype = ctypes.c_int
+    lib.libisyntax_tile_read.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong, ctypes.POINTER(ctypes.c_uint32), ctypes.c_int]
+    lib.libisyntax_tile_read.restype = ctypes.c_int
+    return lib
+
+def lambda_handler(event, context):
+    # libisyntax.so is copied to /opt by Dockerfile.lambda
+    lib = load_api("/opt/libisyntax.so")
+    rc = lib.libisyntax_init()
+    if rc != 0:
+        raise RuntimeError(f"init failed: {rc}")
+
+    # Provide a slide inside the image (e.g., copied to /opt/example.isyntax by Dockerfile.lambda)
+    tmp_slide = "/opt/example.isyntax"
+
+    handle = ctypes.c_void_p()
+    rc = lib.libisyntax_open(tmp_slide.encode("utf-8"), 1, ctypes.byref(handle))
+    if rc != 0:
+        raise RuntimeError(f"open failed: {rc}")
+
+    try:
+        tw = lib.libisyntax_get_tile_width(handle)
+        th = lib.libisyntax_get_tile_height(handle)
+        buf = (ctypes.c_uint32 * (tw * th))()
+        rc = lib.libisyntax_tile_read(handle, ctypes.c_void_p(0), 0, 0, 0, buf, 0x101)  # RGBA
+        if rc != 0:
+            raise RuntimeError(f"tile_read failed: {rc}")
+        return {"tile_w": tw, "tile_h": th}
+    finally:
+        lib.libisyntax_close(handle)
+```
 
 ## Python (ctypes) usage in Lambda
 
@@ -135,6 +198,10 @@ cmake -S libisyntax -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 # Resulting shared library location depends on your toolchain setup
 ```
+
+## Optional: build-only artifact and S3 packaging
+
+If you prefer a ZIP-based distribution of only `libisyntax.so`, `Dockerfile.build` can be used to compile on Amazon Linux, then you can zip and host it on S3. The Lambda handler can load from `/opt` or download to `/tmp`. This was the earlier research path and is not required when using container images.
 
 ## License
 
