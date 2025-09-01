@@ -309,7 +309,12 @@ u8* isyntax_get_associated_image_jpeg(isyntax_t* isyntax, isyntax_image_t* image
     u8* decoded = NULL;
     if (read_offset > 0 && read_size > 0) {
         u8* encoded = malloc(read_size);
+        
+        // Thread-safe file access
+        benaphore_lock(&isyntax->file_mutex);
         size_t bytes_read = file_handle_read_at_offset(encoded, isyntax->file_handle, read_offset, read_size);
+        benaphore_unlock(&isyntax->file_mutex);
+        
         if (bytes_read == read_size) {
             size_t len = 0;
             decoded = base64_decode((u8*)encoded, read_size, &len);
@@ -331,7 +336,12 @@ u8* isyntax_get_icc_profile(isyntax_t* isyntax, isyntax_image_t* image, u32* icc
 	u8* decoded = NULL;
 	if (read_offset > 0 && read_size > 0) {
 		u8* encoded = malloc(read_size);
+		
+		// Thread-safe file access
+		benaphore_lock(&isyntax->file_mutex);
 		size_t bytes_read = file_handle_read_at_offset(encoded, isyntax->file_handle, read_offset, read_size);
+		benaphore_unlock(&isyntax->file_mutex);
+		
 		if (bytes_read == read_size) {
 			size_t len = 0;
 			decoded = base64_decode((u8*)encoded, read_size, &len);
@@ -2977,6 +2987,9 @@ bool isyntax_open(isyntax_t* isyntax, const char* filename, enum libisyntax_open
 	console_print_verbose("Attempting to open iSyntax: %s\n", filename);
 	ASSERT(isyntax);
 
+	// Initialize thread safety mutex
+	isyntax->file_mutex = benaphore_create();
+
 	isyntax->open_flags = flags;
 
 	int ret = 0; (void)ret;
@@ -3553,6 +3566,8 @@ void isyntax_destroy(isyntax_t* isyntax) {
 	if (isyntax->cache) {
 		libisyntax_cache_destroy(isyntax->cache);
 	}
+	// Destroy thread safety mutex
+	benaphore_destroy(&isyntax->file_mutex);
 	file_handle_close(isyntax->file_handle);
 }
 

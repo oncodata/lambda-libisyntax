@@ -119,8 +119,13 @@ static void isyntax_openslide_load_tile_coefficients_ll_or_h(isyntax_cache_t* ca
         // TODO(avirodov): fancy allocators, for multiple sequential blocks (aka chunk). Or let OS do the caching.
         // Adding 7 safety bytes so bitstream_lsb_read() won't access out of bounds in isyntax_hulsken_decompress().
         u8* codeblock_data = malloc(codeblock->block_size + 7);
+        
+        // Thread-safe file access
+        benaphore_lock(&isyntax->file_mutex);
         size_t bytes_read = file_handle_read_at_offset(codeblock_data, isyntax->file_handle,
                                                        codeblock->block_data_offset, codeblock->block_size);
+        benaphore_unlock(&isyntax->file_mutex);
+        
         if (!(bytes_read > 0)) {
             console_print_error("Error: could not read iSyntax data at offset %lld (read size %lld)\n",
                                 codeblock->block_data_offset, codeblock->block_size);

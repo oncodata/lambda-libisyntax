@@ -35,6 +35,7 @@ extern "C" {
 #include "libisyntax.h"
 #include "block_allocator.h"
 #include "work_queue.h"
+#include "benaphore.h"
 
 #include "yxml.h"
 
@@ -403,6 +404,8 @@ typedef struct isyntax_t {
 	isyntax_cache_t* cache;
 	work_queue_t* work_submission_queue;
 	volatile i32 refcount;
+	// Thread safety mutex for file operations
+	benaphore_t file_mutex;
 } isyntax_t;
 
 // function prototypes

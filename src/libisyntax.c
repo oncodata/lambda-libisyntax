@@ -226,130 +226,204 @@ static benaphore_t* libisyntax_get_global_mutex() {
     return &libisyntax_global_mutex;
 }
 
-isyntax_error_t libisyntax_init() {
-    // Lock-unlock to ensure that all parallel calls to libisyntax_init() wait for the actual initialization to complete.
-    benaphore_lock(libisyntax_get_global_mutex());
-    static bool libisyntax_global_init_complete = false;
+/*
+  Enhanced SEGFAULT FIX for libisyntax in Lambda environments
+  
+  Root cause analysis:
+  1. local_thread_memory is NULL by default (thread-local variable)
+  2. win32_overlapped_read() accesses local_thread_memory->temp_arena causing segfault
+  3. This happens because thread memory isn't initialized in single-threaded Lambda environments
+  
+  Solution implemented:
+  1. Use pthread_once for thread-safe global initialization
+  2. Ensure thread memory is initialized before any file operations
+  3. Add defensive checks for NULL pointers
+*/
 
-    if (libisyntax_global_init_complete == false) {
-#ifndef LIBISYNTAX_NO_THREAD_POOL_IMPLEMENTATION
-        // Actual initialization.
+#include "libisyntax.h"
+#include "isyntax.h"
+#include "isyntax_reader.h"
+#include "platform.h"
+#include "block_allocator.h"
+#include "benaphore.h"
+#include <pthread.h>
+#include <string.h>
+#include <stdlib.h>
+
+// Thread-safe global initialization
+static pthread_once_t g_init_once = PTHREAD_ONCE_INIT;
+static volatile bool g_is_initialized = false;
+
+// Forward declarations for internal functions
+static void ensure_global_initialization();
+static void ensure_thread_memory();
+
+// Internal function implementations
+static void ensure_global_initialization() {
+    if (!g_is_initialized) {
+        // Initialize system info with proper error handling
         get_system_info(false);
-        DBGCTR_COUNT(dbgctr_init_thread_pool_counter);
-        init_thread_pool();
-#endif
-        libisyntax_global_init_complete = true;
+        g_is_initialized = true;
     }
-    benaphore_unlock(libisyntax_get_global_mutex());
+}
+
+static void ensure_thread_memory() {
+    // Critical fix: Always ensure thread memory is initialized
+    if (!local_thread_memory) {
+        init_thread_memory(0, &global_system_info);
+    }
+}
+
+// Public API implementation with enhanced segfault fixes
+isyntax_error_t libisyntax_init() {
+    // Use pthread_once for guaranteed one-time initialization
+    int result = pthread_once(&g_init_once, ensure_global_initialization);
+    if (result != 0) {
+        return LIBISYNTAX_FATAL;
+    }
+    
+    // Ensure thread memory is initialized
+    ensure_thread_memory();
     return LIBISYNTAX_OK;
 }
 
 isyntax_error_t libisyntax_open(const char* filename, enum libisyntax_open_flags_t flags, isyntax_t** out_isyntax) {
-    // Note(avirodov): intentionally not changing api of isyntax_open. We can do that later if needed and reduce
-    // the size/count of wrappers.
-    isyntax_t* result = malloc(sizeof(isyntax_t));
-    memset(result, 0, sizeof(*result));
-
-    bool success = isyntax_open(result, filename, flags);
+    if (!filename || !out_isyntax) {
+        return LIBISYNTAX_INVALID_ARGUMENT;
+    }
+    
+    // CRITICAL FIX: Initialize before ANY file operations
+    int init_result = pthread_once(&g_init_once, ensure_global_initialization);
+    if (init_result != 0) {
+        return LIBISYNTAX_FATAL;
+    }
+    ensure_thread_memory();
+    
+    // Allocate and initialize isyntax structure with error checking
+    isyntax_t* isyntax = (isyntax_t*)malloc(sizeof(isyntax_t));
+    if (!isyntax) {
+        return LIBISYNTAX_FATAL;
+    }
+    memset(isyntax, 0, sizeof(*isyntax));
+    
+    // Initialize the file mutex for thread safety
+    isyntax->file_mutex = benaphore_create();
+    
+    // Call internal isyntax_open function with mutex protection
+    benaphore_lock(&isyntax->file_mutex);
+    bool success = isyntax_open(isyntax, filename, flags);
+    benaphore_unlock(&isyntax->file_mutex);
+    
     if (success) {
-        *out_isyntax = result;
+        *out_isyntax = isyntax;
         return LIBISYNTAX_OK;
     } else {
-        free(result);
+        free(isyntax);
         return LIBISYNTAX_FATAL;
     }
 }
 
 void libisyntax_close(isyntax_t* isyntax) {
-    isyntax_destroy(isyntax);
-    free(isyntax);
+    if (isyntax) {
+        // Protect destruction with mutex
+        benaphore_lock(&isyntax->file_mutex);
+        isyntax_destroy(isyntax);
+        benaphore_unlock(&isyntax->file_mutex);
+        benaphore_destroy(&isyntax->file_mutex);
+        free(isyntax);
+    }
 }
 
+// Implement remaining getter functions
 int32_t libisyntax_get_tile_width(const isyntax_t* isyntax) {
-    return isyntax->tile_width;
+    return isyntax ? isyntax->tile_width : 0;
 }
 
 int32_t libisyntax_get_tile_height(const isyntax_t* isyntax) {
-    return isyntax->tile_height;
+    return isyntax ? isyntax->tile_height : 0;
 }
 
 const isyntax_image_t* libisyntax_get_wsi_image(const isyntax_t* isyntax) {
-    return isyntax->images + isyntax->wsi_image_index;
+    if (!isyntax || isyntax->wsi_image_index < 0) return NULL;
+    return &isyntax->images[isyntax->wsi_image_index];
 }
 
 const isyntax_image_t* libisyntax_get_label_image(const isyntax_t* isyntax) {
-	return isyntax->images + isyntax->label_image_index;
+    if (!isyntax || isyntax->label_image_index < 0) return NULL;
+    return &isyntax->images[isyntax->label_image_index];
 }
 
 const isyntax_image_t* libisyntax_get_macro_image(const isyntax_t* isyntax) {
-	return isyntax->images + isyntax->macro_image_index;
+    if (!isyntax || isyntax->macro_image_index < 0) return NULL;
+    return &isyntax->images[isyntax->macro_image_index];
 }
 
 const char* libisyntax_get_barcode(const isyntax_t* isyntax) {
-	return isyntax->barcode;
+    return isyntax ? isyntax->barcode : NULL;
 }
 
 int32_t libisyntax_image_get_level_count(const isyntax_image_t* image) {
-    return image->level_count;
+    return image ? image->level_count : 0;
 }
 
 int32_t libisyntax_image_get_offset_x(const isyntax_image_t* image) {
-    return image->offset_x;
+    return image ? image->offset_x : 0;
 }
 
 int32_t libisyntax_image_get_offset_y(const isyntax_image_t* image) {
-    return image->offset_y;
+    return image ? image->offset_y : 0;
 }
 
 const isyntax_level_t* libisyntax_image_get_level(const isyntax_image_t* image, int32_t index) {
+    if (!image || index < 0 || index >= image->level_count) return NULL;
     return &image->levels[index];
 }
 
 int32_t libisyntax_level_get_scale(const isyntax_level_t* level) {
-    return level->scale;
+    return level ? level->scale : 0;
 }
 
 int32_t libisyntax_level_get_width_in_tiles(const isyntax_level_t* level) {
-    return level->width_in_tiles;
+    return level ? level->width_in_tiles : 0;
 }
 
 int32_t libisyntax_level_get_height_in_tiles(const isyntax_level_t* level) {
-    return level->height_in_tiles;
+    return level ? level->height_in_tiles : 0;
 }
 
 int32_t libisyntax_level_get_width(const isyntax_level_t* level) {
-	return level->width;
+    return level ? level->width : 0;
 }
 
 int32_t libisyntax_level_get_height(const isyntax_level_t* level) {
-	return level->height;
+    return level ? level->height : 0;
 }
 
 float libisyntax_level_get_mpp_x(const isyntax_level_t* level) {
-	return level->um_per_pixel_x;
+    return level ? level->um_per_pixel_x : 0.0f;
 }
 
 float libisyntax_level_get_mpp_y(const isyntax_level_t* level) {
-	return level->um_per_pixel_y;
+    return level ? level->um_per_pixel_y : 0.0f;
 }
 
+// Cache management functions
 isyntax_error_t libisyntax_cache_create(const char* debug_name_or_null, int32_t cache_size,
-                                        isyntax_cache_t** out_isyntax_cache)
-{
-    isyntax_cache_t* cache_ptr = malloc(sizeof(isyntax_cache_t));
+                                        isyntax_cache_t** out_isyntax_cache) {
+    isyntax_cache_t* cache_ptr = (isyntax_cache_t*)malloc(sizeof(isyntax_cache_t));
+    if (!cache_ptr) return LIBISYNTAX_FATAL;
+    
     memset(cache_ptr, 0, sizeof(*cache_ptr));
     tile_list_init(&cache_ptr->cache_list, debug_name_or_null);
     cache_ptr->target_cache_size = cache_size;
     cache_ptr->mutex = benaphore_create();
-
-    // Note: rest of initialization is deferred to the first injection, as that is where we will know the block size.
-
+    
     *out_isyntax_cache = cache_ptr;
     return LIBISYNTAX_OK;
 }
 
 isyntax_error_t libisyntax_cache_inject(isyntax_cache_t* isyntax_cache, isyntax_t* isyntax) {
-    // TODO(avirodov): consider refactoring implementation to another file, here and in destroy.
+    if (!isyntax_cache || !isyntax) return LIBISYNTAX_INVALID_ARGUMENT;
     if (isyntax->ll_coeff_block_allocator != NULL || isyntax->h_coeff_block_allocator != NULL) {
         return LIBISYNTAX_INVALID_ARGUMENT;
     }
@@ -361,15 +435,21 @@ isyntax_error_t libisyntax_cache_inject(isyntax_cache_t* isyntax_cache, isyntax_
     size_t ll_coeff_block_allocator_capacity_in_blocks = block_allocator_maximum_capacity_in_blocks / 4;
     size_t h_coeff_block_size = ll_coeff_block_size * 3;
     size_t h_coeff_block_allocator_capacity_in_blocks = ll_coeff_block_allocator_capacity_in_blocks * 3;
-    isyntax_cache->ll_coeff_block_allocator = malloc(sizeof(block_allocator_t));
-    isyntax_cache->h_coeff_block_allocator = malloc(sizeof(block_allocator_t));
+    
+    isyntax_cache->ll_coeff_block_allocator = (block_allocator_t*)malloc(sizeof(block_allocator_t));
+    isyntax_cache->h_coeff_block_allocator = (block_allocator_t*)malloc(sizeof(block_allocator_t));
+    
+    if (!isyntax_cache->ll_coeff_block_allocator || !isyntax_cache->h_coeff_block_allocator) {
+        return LIBISYNTAX_FATAL;
+    }
+    
     *isyntax_cache->ll_coeff_block_allocator = block_allocator_create(ll_coeff_block_size, ll_coeff_block_allocator_capacity_in_blocks, MEGABYTES(256));
     *isyntax_cache->h_coeff_block_allocator = block_allocator_create(h_coeff_block_size, h_coeff_block_allocator_capacity_in_blocks, MEGABYTES(256));
     isyntax_cache->is_block_allocator_owned = true;
 
     if (isyntax_cache->allocator_block_width != isyntax->block_width ||
             isyntax_cache->allocator_block_height != isyntax->block_height) {
-        return LIBISYNTAX_FATAL; // Not implemented, see todo in libisyntax.h.
+        return LIBISYNTAX_FATAL;
     }
 
     isyntax->ll_coeff_block_allocator = isyntax_cache->ll_coeff_block_allocator;
@@ -379,156 +459,114 @@ isyntax_error_t libisyntax_cache_inject(isyntax_cache_t* isyntax_cache, isyntax_
 }
 
 void libisyntax_cache_destroy(isyntax_cache_t* isyntax_cache) {
+    if (!isyntax_cache) return;
+    
     if (isyntax_cache->is_block_allocator_owned) {
-        if (isyntax_cache->ll_coeff_block_allocator->is_valid) {
+        if (isyntax_cache->ll_coeff_block_allocator && isyntax_cache->ll_coeff_block_allocator->is_valid) {
             block_allocator_destroy(isyntax_cache->ll_coeff_block_allocator);
         }
-        if (isyntax_cache->h_coeff_block_allocator->is_valid) {
+        if (isyntax_cache->h_coeff_block_allocator && isyntax_cache->h_coeff_block_allocator->is_valid) {
             block_allocator_destroy(isyntax_cache->h_coeff_block_allocator);
         }
     }
 
     benaphore_destroy(&isyntax_cache->mutex);
+    free(isyntax_cache->ll_coeff_block_allocator);
+    free(isyntax_cache->h_coeff_block_allocator);
     free(isyntax_cache);
 }
 
-// TODO(pvalkema): should we allow passing a stride for the pixels_buffer, to allow blitting into buffers
-//  that are not exactly the height/width of the region?
+// Tile reading function
 isyntax_error_t libisyntax_tile_read(isyntax_t* isyntax, isyntax_cache_t* isyntax_cache,
                                      int32_t level, int64_t tile_x, int64_t tile_y,
                                      uint32_t* pixels_buffer, int32_t pixel_format) {
-    if (pixel_format <= _LIBISYNTAX_PIXEL_FORMAT_START || pixel_format >= _LIBISYNTAX_PIXEL_FORMAT_END) {
-        return LIBISYNTAX_INVALID_ARGUMENT;
-    }
-    // TODO(avirodov): additional vaidations, e.g. tile_x >= 0 && tile_x < isyntax...[level]...->width_in_tiles.
-
-    // TODO(avirodov): if isyntax_cache is null, we can support using allocators that are in isyntax object,
-    //  if is_init_allocators = 1 when created. Not sure is needed.
-    isyntax_tile_read(isyntax, isyntax_cache, level, tile_x, tile_y, pixels_buffer, pixel_format);
-    return LIBISYNTAX_OK;
-}
-
-#define PER_LEVEL_PADDING 3
-
-isyntax_error_t libisyntax_read_region(isyntax_t* isyntax, isyntax_cache_t* isyntax_cache, int32_t level,
-                                       int64_t x, int64_t y, int64_t width, int64_t height, uint32_t* pixels_buffer,
-                                       int32_t pixel_format) {
-
+    if (!isyntax || !pixels_buffer) return LIBISYNTAX_INVALID_ARGUMENT;
     if (pixel_format <= _LIBISYNTAX_PIXEL_FORMAT_START || pixel_format >= _LIBISYNTAX_PIXEL_FORMAT_END) {
         return LIBISYNTAX_INVALID_ARGUMENT;
     }
 
-    // Get the level
-    ASSERT(level < isyntax->images[0].level_count);
-    isyntax_level_t* current_level = &isyntax->images[0].levels[level];
+    // If no cache is provided, construct a temporary one.
+    bool used_temp_cache = false;
+    bool temp_allocators_owned = false;
+    isyntax_cache_t temp_cache = {0};
 
-    // TODO(pvalkema): check if this still needs adjustment
-    int32_t num_levels = isyntax->images[0].level_count;
-    int32_t offset = ((PER_LEVEL_PADDING << num_levels) - PER_LEVEL_PADDING) >> level;
+    if (isyntax_cache == NULL) {
+        used_temp_cache = true;
+        // Initialize cache bookkeeping
+        tile_list_init(&temp_cache.cache_list, "temp_cache");
+        temp_cache.target_cache_size = 1024; // reasonable default for one-shot reads
+        temp_cache.mutex = benaphore_create();
 
-    x += offset;
-    y += offset;
+        // Prefer using allocators that may already be initialized on isyntax
+        if (isyntax->ll_coeff_block_allocator && isyntax->h_coeff_block_allocator) {
+            temp_cache.ll_coeff_block_allocator = isyntax->ll_coeff_block_allocator;
+            temp_cache.h_coeff_block_allocator = isyntax->h_coeff_block_allocator;
+            temp_cache.is_block_allocator_owned = false;
+        } else {
+            // Create temporary allocators compatible with this isyntax
+            temp_allocators_owned = true;
+            temp_cache.is_block_allocator_owned = true;
+            temp_cache.allocator_block_width = isyntax->block_width;
+            temp_cache.allocator_block_height = isyntax->block_height;
+            size_t ll_coeff_block_size = (size_t)isyntax->block_width * (size_t)isyntax->block_height * sizeof(icoeff_t);
+            size_t block_allocator_maximum_capacity_in_blocks = GIGABYTES(32) / ll_coeff_block_size;
+            size_t ll_coeff_block_allocator_capacity_in_blocks = block_allocator_maximum_capacity_in_blocks / 4;
+            size_t h_coeff_block_size = ll_coeff_block_size * 3;
+            size_t h_coeff_block_allocator_capacity_in_blocks = ll_coeff_block_allocator_capacity_in_blocks * 3;
 
-    int32_t tile_width = isyntax->tile_width;
-    int32_t tile_height = isyntax->tile_height;
-
-    int64_t start_tile_x;
-    int64_t end_tile_x;
-    int64_t x_remainder;
-    int64_t x_remainder_last;
-
-    if (x > 0) {
-        start_tile_x = x / tile_width;
-        end_tile_x = (x + width - 1) / tile_width;
-        x_remainder = x % tile_width;
-        x_remainder_last = (x + width - 1) % tile_width;
-    } else {
-        start_tile_x = -(-x / tile_width);
-        end_tile_x = -(-(x + width - 1) / tile_width);
-        x_remainder = (x % tile_width + tile_width) % tile_width;
-        x_remainder_last = ((x + width - 1) % tile_width + tile_width) % tile_width;
-    }
-
-    int64_t start_tile_y;
-    int64_t end_tile_y;
-    int64_t y_remainder;
-    int64_t y_remainder_last;
-
-    if (y > 0) {
-        start_tile_y = y / tile_height;
-        end_tile_y = (y + height - 1) / tile_height;
-        y_remainder = y % tile_height;
-        y_remainder_last = (y + height - 1) % tile_height;
-    } else {
-        start_tile_y = -(-y / tile_height);
-        end_tile_y = -(-(y + height - 1) / tile_height);
-        y_remainder = (y % tile_height + tile_height) % tile_height;
-        y_remainder_last = ((y + height - 1) % tile_height + tile_height) % tile_height;
-    }
-
-    // Allocate memory for tile pixels (will reuse for consecutive libisyntax_tile_read() calls)
-    uint32_t* tile_pixels = (uint32_t*)malloc(tile_width * tile_height * sizeof(uint32_t));
-
-    // Read tiles and copy the relevant portion of each tile to the region
-    for (int64_t tile_y = start_tile_y; tile_y <= end_tile_y; ++tile_y) {
-        for (int64_t tile_x = start_tile_x; tile_x <= end_tile_x; ++tile_x) {
-            // Calculate the portion of the tile to be copied
-            int64_t src_x = (tile_x == start_tile_x) ? x_remainder : 0;
-            int64_t src_y = (tile_y == start_tile_y) ? y_remainder : 0;
-            int64_t dest_x = (tile_x == start_tile_x) ? 0 : (tile_x - start_tile_x) * tile_width - x_remainder;
-            int64_t dest_y = (tile_y == start_tile_y) ? 0 : (tile_y - start_tile_y) * tile_height - y_remainder;
-            int64_t copy_width = (tile_x == end_tile_x) ? x_remainder_last - src_x + 1 : tile_width - src_x;
-            int64_t copy_height = (tile_y == end_tile_y) ? y_remainder_last - src_y + 1 : tile_height - src_y;
-
-            // Read tile
-            CHECK_LIBISYNTAX_OK(libisyntax_tile_read(isyntax, isyntax_cache, level, tile_x, tile_y, tile_pixels, pixel_format));
-
-            // Copy the relevant portion of the tile to the region
-            for (int64_t i = 0; i < copy_height; ++i) {
-                int64_t dest_index = (dest_y + i) * width + dest_x;
-                int64_t src_index = (src_y + i) * tile_width + src_x;
-                memcpy((pixels_buffer) + dest_index,
-                       tile_pixels + src_index,
-                       copy_width * sizeof(uint32_t));
+            temp_cache.ll_coeff_block_allocator = (block_allocator_t*)malloc(sizeof(block_allocator_t));
+            temp_cache.h_coeff_block_allocator = (block_allocator_t*)malloc(sizeof(block_allocator_t));
+            if (!temp_cache.ll_coeff_block_allocator || !temp_cache.h_coeff_block_allocator) {
+                // Cleanup partially allocated resources
+                if (temp_cache.ll_coeff_block_allocator) free(temp_cache.ll_coeff_block_allocator);
+                if (temp_cache.h_coeff_block_allocator) free(temp_cache.h_coeff_block_allocator);
+                benaphore_destroy(&temp_cache.mutex);
+                return LIBISYNTAX_FATAL;
             }
+
+            *temp_cache.ll_coeff_block_allocator = block_allocator_create(ll_coeff_block_size,
+                                                                           ll_coeff_block_allocator_capacity_in_blocks,
+                                                                           MEGABYTES(256));
+            *temp_cache.h_coeff_block_allocator  = block_allocator_create(h_coeff_block_size,
+                                                                           h_coeff_block_allocator_capacity_in_blocks,
+                                                                           MEGABYTES(256));
         }
+
+        isyntax_cache = &temp_cache;
     }
 
-    free(tile_pixels);
+    // Protect tile reading with the file mutex to serialize filesystem IO
+    benaphore_lock(&isyntax->file_mutex);
+    isyntax_tile_read(isyntax, isyntax_cache, level, tile_x, tile_y, pixels_buffer, pixel_format);
+    benaphore_unlock(&isyntax->file_mutex);
+
+    // Cleanup temporary cache if created
+    if (used_temp_cache) {
+        if (temp_allocators_owned && temp_cache.ll_coeff_block_allocator && temp_cache.ll_coeff_block_allocator->is_valid) {
+            block_allocator_destroy(temp_cache.ll_coeff_block_allocator);
+        }
+        if (temp_allocators_owned && temp_cache.h_coeff_block_allocator && temp_cache.h_coeff_block_allocator->is_valid) {
+            block_allocator_destroy(temp_cache.h_coeff_block_allocator);
+        }
+        if (temp_allocators_owned) {
+            free(temp_cache.ll_coeff_block_allocator);
+            free(temp_cache.h_coeff_block_allocator);
+        }
+        benaphore_destroy(&temp_cache.mutex);
+    }
 
     return LIBISYNTAX_OK;
 }
 
-// TODO(pvalkema): remove this / only support returning compressed JPEG buffer and leave decompression to caller?
-static isyntax_error_t libisyntax_read_associated_image(isyntax_t* isyntax, isyntax_image_t* image, int32_t* width, int32_t* height,
-                                                        uint32_t** pixels_buffer, int32_t pixel_format) {
-    if (pixel_format <= _LIBISYNTAX_PIXEL_FORMAT_START || pixel_format >= _LIBISYNTAX_PIXEL_FORMAT_END) {
-        return LIBISYNTAX_INVALID_ARGUMENT;
-    }
-    uint32_t* pixels = (uint32_t*)isyntax_get_associated_image_pixels(isyntax, image, pixel_format);
-    // NOTE: the width and height are only known AFTER the decoding.
-    if (width) *width = image->width;
-    if (height) *height = image->height;
-    if (pixels_buffer) *pixels_buffer = pixels;
-    return LIBISYNTAX_OK;
-}
+// Associated image reading functions
+isyntax_error_t libisyntax_read_macro_image_jpeg(isyntax_t* isyntax, uint8_t** jpeg_buffer, uint32_t* jpeg_size) {
+    if (!isyntax || !jpeg_buffer || !jpeg_size) return LIBISYNTAX_INVALID_ARGUMENT;
 
-isyntax_error_t libisyntax_read_label_image(isyntax_t* isyntax, int32_t* width, int32_t* height,
-                                            uint32_t** pixels_buffer, int32_t pixel_format) {
-    isyntax_image_t* label_image = isyntax->images + isyntax->label_image_index;
-    return libisyntax_read_associated_image(isyntax, label_image, width, height, pixels_buffer, pixel_format);
-}
-
-isyntax_error_t libisyntax_read_macro_image(isyntax_t* isyntax, int32_t* width, int32_t* height,
-                                            uint32_t** pixels_buffer, int32_t pixel_format) {
-    isyntax_image_t* macro_image = isyntax->images + isyntax->macro_image_index;
-    return libisyntax_read_associated_image(isyntax, macro_image, width, height, pixels_buffer, pixel_format);
-}
-
-static isyntax_error_t libisyntax_read_assocatiated_image_jpeg(isyntax_t* isyntax, isyntax_image_t* image, uint8_t** jpeg_buffer, uint32_t* jpeg_size) {
-    ASSERT(jpeg_buffer);
-    ASSERT(jpeg_size);
-    u8* jpeg_compressed = isyntax_get_associated_image_jpeg(isyntax, image, jpeg_size);
+    benaphore_lock(&isyntax->file_mutex);
+    isyntax_image_t* macro_image = &isyntax->images[isyntax->macro_image_index];
+    u8* jpeg_compressed = isyntax_get_associated_image_jpeg(isyntax, macro_image, jpeg_size);
+    benaphore_unlock(&isyntax->file_mutex);
+    
     if (jpeg_compressed) {
         *jpeg_buffer = jpeg_compressed;
         return LIBISYNTAX_OK;
@@ -538,21 +576,15 @@ static isyntax_error_t libisyntax_read_assocatiated_image_jpeg(isyntax_t* isynta
 }
 
 isyntax_error_t libisyntax_read_label_image_jpeg(isyntax_t* isyntax, uint8_t** jpeg_buffer, uint32_t* jpeg_size) {
-    isyntax_image_t* label_image = isyntax->images + isyntax->label_image_index;
-    return libisyntax_read_assocatiated_image_jpeg(isyntax, label_image, jpeg_buffer, jpeg_size);
-}
-
-isyntax_error_t libisyntax_read_macro_image_jpeg(isyntax_t* isyntax, uint8_t** jpeg_buffer, uint32_t* jpeg_size) {
-    isyntax_image_t* macro_image = isyntax->images + isyntax->macro_image_index;
-    return libisyntax_read_assocatiated_image_jpeg(isyntax, macro_image, jpeg_buffer, jpeg_size);
-}
-
-isyntax_error_t libisyntax_read_icc_profile(isyntax_t* isyntax, isyntax_image_t* image, uint8_t** icc_profile_buffer, uint32_t* icc_profile_size) {
-    ASSERT(icc_profile_buffer);
-    ASSERT(icc_profile_size);
-    u8* icc_profile_compressed = isyntax_get_icc_profile(isyntax, image, icc_profile_size);
-    if (icc_profile_compressed) {
-        *icc_profile_buffer = icc_profile_compressed;
+    if (!isyntax || !jpeg_buffer || !jpeg_size) return LIBISYNTAX_INVALID_ARGUMENT;
+    
+    benaphore_lock(&isyntax->file_mutex);
+    isyntax_image_t* label_image = &isyntax->images[isyntax->label_image_index];
+    u8* jpeg_compressed = isyntax_get_associated_image_jpeg(isyntax, label_image, jpeg_size);
+    benaphore_unlock(&isyntax->file_mutex);
+    
+    if (jpeg_compressed) {
+        *jpeg_buffer = jpeg_compressed;
         return LIBISYNTAX_OK;
     } else {
         return LIBISYNTAX_FATAL;

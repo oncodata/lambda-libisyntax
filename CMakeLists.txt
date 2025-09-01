@@ -28,7 +28,8 @@ if(IS_APPLE_SILICON)
     # Enable NEON for ARM-based Apple Silicon
     add_compile_options(-march=armv8.2-a+fp16+simd)
 else()
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -march=native")
+    # Avoid CPU-specific instructions that may not be available on AWS Lambda hosts.
+    # Do not set -march=native; compile for a generic baseline instead.
 endif()
 
 
@@ -79,6 +80,9 @@ else()
 endif()
 
 add_library(isyntax ${LIBISYNTAX_COMMON_SOURCE_FILES})
+
+# Disable STB SIMD paths to avoid runtime illegal instruction on heterogeneous CPUs
+target_compile_definitions(isyntax PRIVATE STBI_NO_SIMD)
 
 if (WIN32)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -static-libgcc -static")
