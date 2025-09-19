@@ -590,3 +590,67 @@ isyntax_error_t libisyntax_read_label_image_jpeg(isyntax_t* isyntax, uint8_t** j
         return LIBISYNTAX_FATAL;
     }
 }
+
+isyntax_error_t libisyntax_read_region(isyntax_t* isyntax, isyntax_cache_t* isyntax_cache, int32_t level, int64_t x, int64_t y, int64_t width, int64_t height, uint32_t* pixels_buffer, int32_t pixel_format) {
+    if (!isyntax || !pixels_buffer || width <= 0 || height <= 0) {
+        return LIBISYNTAX_INVALID_ARGUMENT;
+    }
+    if (pixel_format <= _LIBISYNTAX_PIXEL_FORMAT_START || pixel_format >= _LIBISYNTAX_PIXEL_FORMAT_END) {
+        return LIBISYNTAX_INVALID_ARGUMENT;
+    }
+
+    const isyntax_image_t* wsi = libisyntax_get_wsi_image(isyntax);
+    if (!wsi) return LIBISYNTAX_INVALID_ARGUMENT;
+
+    const isyntax_level_t* level_info = libisyntax_image_get_level(wsi, level);
+    if (!level_info) return LIBISYNTAX_INVALID_ARGUMENT;
+
+    int32_t tile_width = libisyntax_get_tile_width(isyntax);
+    int32_t tile_height = libisyntax_get_tile_height(isyntax);
+
+    // Allocate a temporary buffer for reading tiles.
+    uint32_t* tile_buffer = (uint32_t*)malloc((size_t)tile_width * tile_height * sizeof(uint32_t));
+    if (!tile_buffer) {
+        return LIBISYNTAX_FATAL;
+    }
+
+    // Calculate tile boundaries for the requested region
+    int32_t start_tile_x = (int32_t)(x / tile_width);
+    int32_t start_tile_y = (int32_t)(y / tile_height);
+    int32_t end_tile_x = (int32_t)((x + width - 1) / tile_width);
+    int32_t end_tile_y = (int32_t)((y + height - 1) / tile_height);
+
+    for (int32_t ty = start_tile_y; ty <= end_tile_y; ++ty) {
+        for (int32_t tx = start_tile_x; tx <= end_tile_x; ++tx) {
+            // Read the entire tile that contains a portion of our region.
+            isyntax_error_t read_result = libisyntax_tile_read(isyntax, isyntax_cache, level, tx, ty, tile_buffer, pixel_format);
+            if (read_result != LIBISYNTAX_OK) {
+                free(tile_buffer);
+                return read_result; // Propagate the error
+            }
+
+            // Calculate the intersection of the requested region and the current tile.
+            int64_t tile_origin_x = (int64_t)tx * tile_width;
+            int64_t tile_origin_y = (int64_t)ty * tile_height;
+
+            int64_t intersect_x0 = (x > tile_origin_x) ? x : tile_origin_x;
+            int64_t intersect_y0 = (y > tile_origin_y) ? y : tile_origin_y;
+            int64_t intersect_x1 = (x + width < tile_origin_x + tile_width) ? (x + width) : (tile_origin_x + tile_width);
+            int64_t intersect_y1 = (y + height < tile_origin_y + tile_height) ? (y + height) : (tile_origin_y + tile_height);
+
+            // Copy the intersecting pixels from the tile buffer to the output buffer.
+            for (int64_t src_y = intersect_y0; src_y < intersect_y1; ++src_y) {
+                int64_t dest_y = src_y - y;
+                for (int64_t src_x = intersect_x0; src_x < intersect_x1; ++src_x) {
+                    int64_t dest_x = src_x - x;
+                    int64_t src_index = (src_y - tile_origin_y) * tile_width + (src_x - tile_origin_x);
+                    int64_t dest_index = dest_y * width + dest_x;
+                    pixels_buffer[dest_index] = tile_buffer[src_index];
+                }
+            }
+        }
+    }
+
+    free(tile_buffer);
+    return LIBISYNTAX_OK;
+}
